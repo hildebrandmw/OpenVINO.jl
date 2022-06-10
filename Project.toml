@@ -3,6 +3,10 @@ uuid = "e8480b9b-df41-49ee-bbfa-92e04b6646d7"
 authors = ["Mark Hildebrand <mhildebrand@ucdavis.edu> and contributors"]
 version = "0.1.0"
 
+[deps]
+Cassette = "7057c7e9-c182-5462-911a-8362d720325c"
+CxxWrap = "1f15a43c-97ca-5a2a-ae31-89f07a497df4"
+
 [compat]
 julia = "1"
 
