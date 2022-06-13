@@ -64,15 +64,51 @@ openvino_convert(::Type{T}) where {T<:Number} = Element(T)
 ##### Shape
 #####
 
+fillto(len::Integer, value::Integer) = ntuple(_ -> value, Val(len))
+function fillto(len::Integer, value::Union{Tuple,AbstractArray})
+    repititions, remainder = divrem(len, length(value))
+    @assert iszero(remainder)
+    iter = Iterators.flatten(Iterators.repeated(value, repititions))
+    return (collect(iter)...,)
+end
+
 # Automatically convert between row-major and column-major representations
 struct Shape{T<:Tuple}
     shape::T
+
+    Shape(shape::NTuple{N,Int}) where {N} = new{NTuple{N,Int}}(shape)
+    Shape(shape::T) where {T<:Tuple} = Shape(convert.(Int, shape))
 end
 Shape(x::AbstractArray) = Shape(size(x))
 Shape(shape::Shape) = shape
+Shape(len::Integer, x::Union{Integer,Tuple,AbstractArray}) = Shape(fillto(len, x))
+
 openvino_convert(shape::Shape) = collect(reverse(shape.shape))
 openvino_convert(::Shape{Tuple{}}) = Vector{Int}()
 Base.length(::Shape{T}) where {T} = length(T)
+
+# # Here, is the machinery that does the dispatch.
+# _expand(N, x::Integer) = fill(Int(x), N)
+#
+# # Numbers
+# shape(N, x::Number) = _expand(N, x)
+# strides(N, x::Number) = _expand(N, x)
+#
+# # Tuples and Vectors
+# maybecollect(x::Vector) = x
+# maybecollect(x) = collect(x)
+#
+# function ordered(N, x)
+#     # Determine how many repetitions we need
+#     repitions, remainder = divrem(length(x), N)
+#     if !iszero(remainder)
+#         error("The length of `x` must be divisible by $N")
+#     end
+#
+#     return _reversed(repeat(maybecollect(x), repitions))
+# end
+# shape(N, x::Union{Tuple,Vector}) = ordered(N, x)
+# strides(N, x::Union{Tuple,Vector}) = ordered(N, x)
 
 #####
 ##### Strides
@@ -81,8 +117,13 @@ Base.length(::Shape{T}) where {T} = length(T)
 # Automatically convert between row-major and column-major representations
 struct Strides{T<:Tuple}
     strides::T
+
+    Strides(strides::NTuple{N,Int}) where {N} = new{NTuple{N,Int}}(strides)
+    Strides(strides::T) where {T<:Tuple} = Strides(convert.(Int, strides))
 end
 Strides(x::AbstractArray{T}) where {T} = Strides(sizeof(T) .* strides(x))
+Strides(strides::Strides) = strides
+Strides(len::Integer, x::Union{Integer,Tuple,AbstractArray}) = Strides(fillto(len, x))
 function openvino_convert(strides::Strides{T}) where {T}
     return collect(reverse(strides.strides))
 end

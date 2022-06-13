@@ -8,18 +8,6 @@ untuple(x::Tuple{T}) where {T} = first(x)
 unwrap_zerodim(x::AbstractArray) = x
 unwrap_zerodim(x::AbstractArray{T,0}) where {T} = x[]
 
-# NOTE: Register was required in the past for some nodes like `BatchNorm` that left
-# dangling nodes in the computation graph that then led ngraph to segfault
-#
-# TODO: Does this still happen?
-"""
-    __register(x::Node) -> Nothing
-
-By default, becomes a no-op. When executed under [`CompileCtx`](@ref), registers `x` as a
-hidden output of a ngraph function.
-"""
-__register(::Node) = nothing
-
 #####
 ##### Cassette Magic
 #####
@@ -27,16 +15,12 @@ __register(::Node) = nothing
 Cassette.@context CompileCtx
 struct CompileMetadata
     training::Bool
-
-    # Mapping of a Parameter array to nGraph Node
-    array_to_node::IdDict{Any,Node}
-
-    # Keep track of the constants we have created.
+    parameters::IdDict{Any,Node}
     constants::IdDict{Any,Node}
 end
 
-function CompileMetadata(array_to_node, training::Bool)
-    return CompileMetadata(training, array_to_node, IdDict{Any,Node}())
+function CompileMetadata(parameters, training::Bool)
+    return CompileMetadata(training, parameters, IdDict{Any,Node}())
 end
 
 # Flag to indicate if we are training or not.
@@ -48,68 +32,48 @@ istraining(x::CompileCtx) = x.metadata.training
 ##### Cassette Overdubs
 #####
 
-function Base.get(ctx::CompileCtx, x::AbstractArray) where {T,N}
+function get_cached!(ctx::CompileCtx, x::AbstractArray)
+    (; metadata) = ctx
     # Check if this array is a parameter.
     # If so, get our cached input for it.
-    node = get(ctx.metadata.array_to_node, x, nothing)
+    node = get(metadata.parameters, x, nothing)
     if !isnothing(node)
         return node
     end
 
     # Check if we've already made a constant for this object.
-    node = get(ctx.metadata.constants, x, nothing)
+    # If not, create and register one.
+    node = get(metadata.constants, x, nothing)
     if isnothing(node)
         node = constant(x)
-        ctx.metadata.constants[x] = node
+        metadata.constants[x] = node
     end
     return node
 end
 
+Base.get(ctx::CompileCtx, x::AbstractArray{T,N}) where {T,N} = get(Node{T,N}, ctx, x)
+Base.get(::Type{Node{T,N}}, ::CompileCtx, node::Node{T,N}) where {T,N} = node
+function Base.get(::Type{Node{T1,N1}}, ::CompileCtx, node::Node{T2,N2}) where {T1,N1,T2,N2}
+    msg = "Unmatched call to cached node. Expected Node{$T1,$N1}, got Node {$T2,$N2}!"
+    return error(msg)
+end
+
 function Base.get(::Type{Node{T,N}}, ctx::CompileCtx, x::AbstractArray) where {T,N}
-    node = get(ctx, x)
+    node = get_cached!(ctx, x)
     @assert isa(node, Node{T,N})
     return node
 end
 
-# Hijack Node constructors from Arrays
+# Overdub Node constructors from Arrays
 function Cassette.overdub(ctx::CompileCtx, ::Type{Node{T,N}}, x::AbstractArray) where {T,N}
     return get(Node{T,N}, ctx, x)
 end
 
-# Do not hijack creating nodes from nodes.
+# Do not overdub creating nodes from nodes.
 Cassette.overdub(ctx::CompileCtx, f::Type{<:Node}, x::Node) = f(x)
-
-# Get around Cassette bug with `reverse`
-Cassette.overdub(::CompileCtx, ::typeof(reverse), args...) = reverse(args...)
-
-# # Hijack these layers
-# Cassette.overdub(ctx::CompileCtx, f::Flux.Dense, args...) =
-#     Cassette.overdub(ctx, _dense_impl, f, args...)
-
-# function Cassette.overdub(
-#     ctx::CompileCtx, f::T, x
-# ) where {T<:Union{Flux.Conv,Flux.CrossCor}}
-#     return convolution_implementation(
-#         x,
-#         get(ctx, f.weight),
-#         get(ctx, f.bias);
-#         f.stride,
-#         f.pad,
-#         f.dilation,
-#         activation = f.σ,
-#     )
-# end
-
-# Cassette.overdub(ctx::CompileCtx, f::Flux.CrossCor, args...) =
-#     Cassette.overdub(ctx, _conv_impl, f, args...)
-#
-# Cassette.overdub(ctx::CompileCtx, f::Flux.BatchNorm, args...) =
-#     Cassette.overdub(ctx, _batchnorm_impl, f, args...)
 
 # Short circuits to reduce compile times
 Cassette.overdub(::CompileCtx, f::typeof(rand), args...) = f(args...)
-#Cassette.overdub(ctx::CompileCtx, f::typeof(Flux.glorot_normal), args...) = f(args...)
-#Cassette.overdub(ctx::CompileCtx, f::typeof(Flux.glorot_uniform), args...) = f(args...)
 
 #####
 ##### Main `compile` entrypoint
@@ -121,10 +85,7 @@ Cassette.overdub(::CompileCtx, f::typeof(rand), args...) = f(args...)
 Trace and compile a Flux model `f` with `args`.
 """
 function compile(f, x...; kw...)
-    # Build the nGraph computation graph
     trace, _ = snoop(f, x...; kw...)
-
-    # pass the trace as well as the optimizer arguments to create the executable.
     return make(trace; kw...)
 end
 
@@ -189,13 +150,7 @@ function snoop(f, xs...; training = false, parameters = (), kw...)
 end
 
 function make(trace::Trace; training = false, kw...)
-    (;
-        input_arrays,
-        input_nodes,
-        output_nodes,
-        parameter_arrays,
-        parameter_nodes,
-    ) = trace
+    (; input_arrays, input_nodes, output_nodes, parameter_arrays, parameter_nodes) = trace
     # Sanity check on inputs
     @assert length(parameter_arrays) == length(parameter_nodes)
     for (_array, _node) in zip(parameter_arrays, parameter_nodes)
@@ -228,7 +183,7 @@ end
 ##### OpenVINOFunction
 #####
 
-struct CompiledFunction{T <: Tuple}
+struct CompiledFunction{T<:Tuple}
     request::InferRequest
     outputs::T
 end
@@ -241,29 +196,3 @@ function (fn::CompiledFunction)()
     return untuple(unwrap_zerodim.(outputs))
 end
 
-# #####
-# ##### Executable
-# #####
-#
-# struct CallableFunction{O}
-#     ex::Executable
-#     inputs::Vector{Tensor}
-#     outputs::NTuple{O,Tensor}
-#     implicit_outputs::Vector{Tensor}
-# end
-#
-# allinputs(x::CallableFunction) = x.inputs
-# function alloutputs(x::CallableFunction)
-#     return collect(Iterators.flatten((x.outputs, x.implicit_outputs)))
-# end
-#
-# function (ex::CallableFunction)()
-#     inputs = allinputs(ex)
-#     outputs = alloutputs(ex)
-#
-#     # Since we're passing wrapped type to C++, we have to cast them to Any's which is
-#     # kind of gross - but w/e
-#     ex.ex(inputs, outputs)
-#     return untuple(ex.outputs)
-# end
-#

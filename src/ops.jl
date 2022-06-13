@@ -82,6 +82,7 @@ _forward(::typeof(-)) = subtract
 _forward(::typeof(^)) = power
 # _forward(::typeof(NNlib.σ)) = sigmoid
 _forward(::typeof(/)) = divide
+_forward(::typeof(Base.sqrt)) = _sqrt
 
 # Use an indirection that usually promotes to constants, but allows the tracer to
 # override to parameters.
@@ -135,30 +136,22 @@ Base.:+(a::Node, b::Node) = add(a, b)
 ##### AvgPool
 #####
 
-# function avgpool(x::Node{T,N}, kernel; pad = 0, stride = kernel) where {T,N}
-#     return @op T N op_avgpool(
-#         x,
-#         strides(N - 2, stride),
-#         shape(N - 2, pad),
-#         shape(N - 2, pad),
-#         shape(N - 2, kernel),
-#         false,
-#     )
-# end
-# Flux.meanpool(x::Node, args...; kw...) = avgpool(x, args...; kw...)
+function avgpool(x::Node{T,N}, kernel; pad = 0, stride = kernel) where {T,N}
+    pads_above, pads_below = handlepad(Val(N), pad)
+    return @op T N op_avgpool(
+        x, Strides(N - 2, stride), pads_below, pads_above, Shape(N - 2, kernel), true
+    )
+end
 
-# #####
-# ##### BatchNorm
-# #####
-#
-# function batchnorm_training(input::Node, γ::Node, β::Node, ϵ)
-#     return Node(Lib.op_batchnorm_training(
-#         getpointer(input),
-#         getpointer(γ),
-#         getpointer(β),
-#         convert(Float64, ϵ)
-#     ))
-# end
+#####
+##### BatchNorm
+#####
+
+function batchnorm_inference(
+    x::Node{T,N}, γ::Node, β::Node, μ::Node, σ²::Node, ϵ
+) where {T,N}
+    return @op T N op_batchnorm_inference(x, γ, β, μ, σ², convert(Float64, ϵ))
+end
 
 #####
 ##### Broadcast
@@ -172,15 +165,15 @@ function Base.broadcast(a::Node{T}, dims::NTuple{N,Int64}) where {T,N}
     return Base.broadcast(a, constant(Shape(dims)))
 end
 
-# #####
-# ##### Concat
-# #####
-#
-# function concat(nodes::Vector{Node{T,N}}; dims::Integer = 1) where {T,N}
-#     # Flip dims for column -> row
-#     return @op T N op_concat(nodes, N - dims)
-# end
-# Base.cat(x::Node...; kw...) = concat(collect(x); kw...)
+#####
+##### Concat
+#####
+
+function concat(nodes::Vector{Node{T,N}}; dims::Integer = 1) where {T,N}
+    # Flip dims for column -> row
+    return @op T N op_concat(nodes, N - dims)
+end
+Base.cat(x::Node...; kw...) = concat(collect(x); kw...)
 
 #####
 ##### Constants
@@ -193,6 +186,7 @@ function constant(x::T) where {T<:Number}
 end
 
 constant(x::Shape{NTuple{N,T}}) where {N,T} = constant(openvino_convert(x))
+constant(x::NTuple{N,T}) where {N,T} = constant(collect(x))
 function constant(x::AbstractArray{T,N}) where {T,N}
     # Reinterpret the `x` as a byte array
     _x = collect(reinterpret(UInt8, reshape(x, :)))
@@ -211,41 +205,32 @@ function convert_eltype(::Type{T}, x::Node{U,N}) where {T,U,N}
     @op T N op_convert(x, T)
 end
 
-# #####
-# ##### Convolution
-# #####
-#
-# function handlepad(::Val{N}, pad::Integer) where {N}
-#     padvec = shape(N-2, pad)
-#     return padvec, padvec
-# end
-#
-# function handlepad(::Val{N}, pad::NTuple{M}) where {N,M}
-#     if M == N
-#         return collect(pad[1:2:M]), collect(pad[2:2:M])
-#     else
-#         error()
-#     end
-# end
-#
-# function convolution(
-#     x::Node{T,N},
-#     weight::Node{T,N};
-#     stride = 1,
-#     pad = 0,
-#     dilation = 1,
-# ) where {T,N}
-#     @show stride, pad, dilation
-#     pads_above, pads_below = handlepad(Val(N), pad)
-#     return @op T N op_convolution(
-#         x,
-#         weight,
-#         strides(N - 2, stride),
-#         pads_above,
-#         pads_below,
-#         shape(N - 2, dilation),
-#     )
-# end
+#####
+##### Convolution
+#####
+
+function handlepad(::Val{N}, pad::Integer) where {N}
+    padvec = Shape(N - 2, pad)
+    return padvec, padvec
+end
+
+function handlepad(::Val{N}, pad::NTuple{M}) where {N,M}
+    if M == N
+        return collect(pad[1:2:M]), collect(pad[2:2:M])
+    else
+        error()
+    end
+end
+
+function convolution(
+    x::Node{T,N}, weight::Node{T,N}; stride = 1, pad = 0, dilation = 1
+) where {T,N}
+    @show stride, pad, dilation
+    pads_above, pads_below = handlepad(Val(N), pad)
+    return @op T N op_convolution(
+        x, weight, Strides(N - 2, stride), pads_above, pads_below, Strides(N - 2, dilation)
+    )
+end
 
 #####
 ##### Divide
@@ -264,23 +249,33 @@ Base.://(a::Node{T,0}, b::Node{T,0}) where {T} = divide(a, b)
 mul(a::Node{T}, b::Node{T}) where {T} = @op T op_matmul(b, a, false, false)
 Base.:*(x::Node, y::Node) = mul(x, y)
 
-# #####
-# ##### Indexing
-# #####
-#
-# _lb(i) = i
-# _lb(::Colon) = 1
-#
-# _ub(bound, i) = i
-# _ub(bound, ::Colon) = bound
-# function Base.getindex(x::Node{T,N}, args...) where {T,N}
-#     sz = size(x)
-#     # Subtract 1 from the lower bound since the lower bounds are inclusive in ngraph.
-#     # Leave the upper bounds as is since the upper-bounds are exclusive.
-#     lb = map(_lb, args) .- 1
-#     ub = ntuple(i -> _ub(sz[i], args[i]), Val(length(args)))
-#     return @op T N op_slice(x, shape(lb), shape(ub))
-# end
+#####
+##### Indexing
+#####
+
+function slice(
+    x::Node{T,N}, start::NTuple{N,Int}, stop::NTuple{N,Int}, step::NTuple{N,Int}
+) where {T,N}
+    return @op T N op_slice(
+        x, constant(reverse(start)), constant(reverse(stop)), constant(reverse(step))
+    )
+end
+
+function reverse_dims(x::Node{T,N}, dims) where {T,N}
+    indims(i) = in(i, dims)
+
+    # The semantics of OpenVINO are that:
+    # 1. End points are exclusive (and thus not added).
+    # 2. Negative axes counted as starting at the end of the given dimension.
+    #    So, an and value of "-1" is actually the last element.
+    #
+    # This means that in order to actually include `all` elements of the reversed slice,
+    # we need to actually use `-size(x, i) - 1`.
+    start = ntuple(i -> (indims(i) ? -1 : 0), Val(N))
+    stop = ntuple(i -> (indims(i) ? -size(x, i) - 1 : size(x, i)), Val(N))
+    step = ntuple(i -> (indims(i) ? -1 : 1), Val(N))
+    return slice(x, start, stop, step)
+end
 
 #####
 ##### GetOutput
@@ -301,44 +296,21 @@ Base.log(a::Node{T,N}) where {T,N} = @op T N op_log(a)
 # The semantics between max and maximum are flipped around beween Julia and nGraph
 Base.max(a::U, b::U) where {T,N,U<:Node{T,N}} = @op T N op_maximum(a, b)
 
-# #####
-# ##### MaxPool
-# #####
-#
-# function maxpool(x::Node{T,N}, kernel; pad = 0, stride = kernel) where {T,N}
-#     return @op T N op_maxpool(
-#         x,
-#         strides(N - 2, stride),
-#         shape(N - 2, pad),
-#         shape(N - 2, pad),
-#         shape(N - 2, kernel),
-#     )
-# end
-# Flux.maxpool(x::Node, args...; kw...) = maxpool(x, args...; kw...)
+#####
+##### MaxPool
+#####
 
-# function Flux.maxpool(x::Node{T,N}, shape::Tuple; pad = 0, stride = shape) where {T,N}
-#     # Convert to nGraph types
-#     window_shape = Shape(shape)
-#     strides = Strides(expand(N-2, stride))
-#     padding_below = Shape(expand(N-2, pad))
-#     padding_above = Shape(expand(N-2, pad))
-#
-#     ptr = Lib.op_maxpool(getpointer(x), window_shape, strides, padding_below, padding_above)
-#     return Node{T,N}(ptr)
-# end
-#
-# stride_size(c::NNlib.PoolDims{N,K,S,P,D}) where {N,K,S,P,D} = S
-# pad_size(c::NNlib.PoolDims{N,K,S,P,D}) where {N,K,S,P,D} = P
-# function NNlib.maxpool(x::Node{T,N}, dims::NNlib.PoolDims) where {T,N}
-#     ptr = Lib.op_maxpool(
-#         getpointer(x),
-#         Shape(NNlib.kernel_size(dims)),             # window_shape
-#         Strides(stride_size(dims)),                 # strides (same as window_shape)
-#         Shape(pad_size(dims)[1:div(N,2)]),          # padding_below
-#         Shape(pad_size(dims)[(div(N,2) + 1):N]),    # padding_above
-#     )
-#     return Node{T,N}(ptr)
-# end
+function maxpool(x::Node{T,N}, kernel; pad = 0, stride = kernel, dilation = 1) where {T,N}
+    pads_above, pads_below = handlepad(Val(N), pad)
+    return @op T N op_maxpool(
+        x,
+        Strides(N - 2, stride),
+        Strides(N - 2, dilation),
+        pads_below,
+        pads_above,
+        Shape(N - 2, kernel),
+    )
+end
 
 #####
 ##### Multiply
@@ -360,14 +332,13 @@ Base.min(a::Node{T,N}, b::Node{T,N}) where {T,N} = @op T N op_minimum(a, b)
 negative(a::Node{T,N}) where {T,N} = @op T N op_negative(a)
 Base.:-(a::Node) = negative(a)
 
-# #####
-# ##### permutedims
-# #####
+#####
+##### permutedims
+#####
 
-# function Base.permutedims(x::Node{T,N}, permutation::NTuple{N,Int}) where {N,T}
-#     newsize = ntuple(i -> size(x, permutation[i]), Val(N))
-#     return @op T N op_reshape(x, collect(permutation .- 1), shape(newsize))
-# end
+function Base.permutedims(x::Node{T,N}, permutation::NTuple{N,Int}) where {N,T}
+    return @op T N op_transpose(x, constant(permutation .- 1))
+end
 
 #####
 ##### Power
@@ -381,7 +352,6 @@ Base.:^(a::N, b::N) where {N<:Node} = power(a, b)
 #####
 
 relu(x::Node{T,N}) where {T,N} = @op T N op_relu(x)
-# Flux.relu(x::Node) = relu(x)
 
 #####
 ##### Reshape
@@ -408,11 +378,13 @@ function softmax(x::Node{T,N}; dims = 1) where {T,N}
 end
 # Flux.softmax(x::Node; kw...) = softmax(x; kw...)
 
-# #####
-# ##### Sqrt
-# #####
-#
-# Base.sqrt(x::N) where {N <: Node} = N(Lib.op_sqrt(getpointer(x)))
+#####
+##### Sqrt
+#####
+
+# Define as `_sqrt` because this is technically the broadcasted version of square root
+# as opposed to the square root of a matrix.
+_sqrt(x::Node{T,N}) where {T,N} = @op T N op_sqrt(x)
 
 #####
 ##### Subtract
@@ -428,15 +400,15 @@ Base.:-(a::N, b::N) where {N<:Node} = subtract(a, b)
 
 # Default to reducing along all dimensions
 function _sum(x::Node{T,N}, ::Colon) where {T,N}
-    return @op T 0 op_reducesum(x, constant(collect(0:(N - 1))))
+    return @op T 0 op_reducesum(x, constant(collect(0:(N - 1))), false)
 end
 
 function _sum(x::Node{T,N}, dims::Union{Tuple,AbstractArray}) where {T,N}
-    return @op T op_reducesum(x, constant(N .- collect(dims)))
+    return @op T op_reducesum(x, constant(N .- collect(dims)), true)
 end
 
 function _sum(x::Node{T,N}, dims::Integer) where {T,N}
-    return @op T (N - 1) op_reducesum(x, constant(N - dims))
+    return @op T N op_reducesum(x, constant(N - dims), true)
 end
 
 function Base.sum(x::Node{T,N}; dims = :) where {T,N}

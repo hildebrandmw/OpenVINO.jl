@@ -10,7 +10,10 @@
 
 // openvino
 #include "openvino/openvino.hpp"
+
+// N.B.: Keep the "opset" macro and the "opsetN.hpp" header file inclusing consistent.
 #include "openvino/opsets/opset8.hpp"
+#define opset opset8
 
 template <typename T> void reverse(T& x) { std::reverse(x.begin(), x.end()); }
 
@@ -71,30 +74,34 @@ template <typename T, typename U> T construct(const U& x) {
 ///// ov::Node casting
 /////
 
-template <typename> struct is_shared_ptr : std::false_type {};
-template <typename T> struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {
-    using parameter_type = T;
-};
+namespace detail {
+    template <typename> struct is_shared_ptr : std::false_type {};
+    template <typename T> struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {
+        using parameter_type = T;
+    };
 
-template <typename T> struct remove_constref {
-    using type = typename std::remove_const<typename std::remove_reference<T>::type>::type;
-};
+    template <typename T> struct remove_constref {
+        using type = typename std::remove_const<typename std::remove_reference<T>::type>::type;
+    };
 
-// Remove `const` and `reference` type modifiers.
-template <typename T> using remove_constref_t = typename remove_constref<T>::type;
+    // Remove `const` and `reference` type modifiers.
+    template <typename T> using remove_constref_t = typename remove_constref<T>::type;
 
-// Return `true` if `T` is a shared pointer.
-template <typename T>
-inline constexpr bool is_shared_ptr_v = is_shared_ptr<remove_constref_t<T>>::value;
+    // Return `true` if `T` is a shared pointer.
+    template <typename T>
+    inline constexpr bool is_shared_ptr_v = is_shared_ptr<remove_constref_t<T>>::value;
 
-// Obtain the type of an object pointed to by a shared pointer.
-template <typename T>
-using shared_ptr_t = typename is_shared_ptr<remove_constref_t<T>>::parameter_type;
+    // Obtain the type of an object pointed to by a shared pointer.
+    template <typename T>
+    using shared_ptr_t = typename is_shared_ptr<remove_constref_t<T>>::parameter_type;
 
-// Return `true` if `T` is a shared pointer that points to a class inheriting from
-// `ov::Node`
-template <typename T>
-inline constexpr bool is_node_ptr = std::is_base_of<ov::Node, shared_ptr_t<T>>::value;
+    // Return `true` if `T` is a shared pointer that points to a class inheriting from
+    // `ov::Node`
+    template <typename T>
+    inline constexpr bool is_node_ptr = std::is_base_of<ov::Node, shared_ptr_t<T>>::value;
+} // namespace detail
+
+
 
 // Convert a shared pointer of some object inheriting from `ov::Node` to a
 // `std::shared_ptr<ov::Node>`. Should work for
@@ -102,8 +109,8 @@ inline constexpr bool is_node_ptr = std::is_base_of<ov::Node, shared_ptr_t<T>>::
 // - const lvalue references
 // - rvalue references
 template <typename T> std::shared_ptr<ov::Node> tonode(T&& x) {
-    static_assert(is_shared_ptr_v<T>);
-    static_assert(is_node_ptr<T>);
+    static_assert(detail::is_shared_ptr_v<T>);
+    static_assert(detail::is_node_ptr<T>);
     return std::dynamic_pointer_cast<ov::Node>(std::forward<T>(x));
 }
 
@@ -112,7 +119,6 @@ template <typename T> std::shared_ptr<ov::Node> tonode(T&& x) {
 /////
 
 // Forward to node creation and auto-cast to `op::Node`
-#define opset opset8
 #define makeop(name, ...) tonode(std::make_shared<ov::opset::name>(__VA_ARGS__))
 
 JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
@@ -327,72 +333,6 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
             return core.compile_model(model, device_name);
         }
     );
-    // mod.method("create_infer_request", [](ov::CompiledModel& model) {
-    //     return model.create_infer_request();
-    // });
-
-    // // TODO: We might be able to optimize this by pre-creating the
-    // `std::vector`
-    // // and just passing those.
-    // .method("call", [](const std::shared_ptr<ov::runtime::CompiledModel>
-    // executable,
-    //             const
-    //             jlcxx::ArrayRef<std::shared_ptr<ngraph::runtime::Tensor>>
-    //             jl_outputs, const
-    //             jlcxx::ArrayRef<std::shared_ptr<ngraph::runtime::Tensor>>
-    //             jl_inputs)
-    // {
-    //     auto inputs = std::vector<std::shared_ptr<ngraph::runtime::Tensor>>(
-    //         jl_inputs.begin(),
-    //         jl_inputs.end()
-    //     );
-
-    //     auto outputs = std::vector<std::shared_ptr<ngraph::runtime::Tensor>>(
-    //         jl_outputs.begin(),
-    //         jl_outputs.end()
-    //     );
-
-    //     executable->call(outputs, inputs);
-    // });
-
-    // /////
-    // ///// Backend
-    // /////
-
-    // mod.add_type<ngraph::runtime::Backend>("Backend")
-    //     .method("compile", [](
-    //         const std::shared_ptr<ngraph::runtime::Backend>& backend,
-    //         const std::shared_ptr<ngraph::Function>& func,
-    //         bool enable_performance_data)
-    //     {
-    //         return backend->compile(func, enable_performance_data);
-    //     })
-    //     .method("remove_compiled_function",
-    //     &ngraph::runtime::Backend::remove_compiled_function)
-    //     .method("get_version", &ngraph::runtime::Backend::get_version);
-
-    // mod.method("create", [](const std::string& type){
-    //     return ngraph::runtime::Backend::create(type);
-    // });
-
-    // /////
-    // ///// Misc Methods
-    // /////
-    // //
-    // // Methods that require the above types to be first declared.
-
-    // mod.method("create_tensor", [](
-    //     const std::shared_ptr<ngraph::runtime::Backend> backend,
-    //     const ngraph::element::Type& element_type,
-    //     const jlcxx::ArrayRef<int64_t> jl_shape,
-    //     void* ptr)
-    // {
-    //     return backend->create_tensor(
-    //         element_type,
-    //         construct<ngraph::Shape>(jl_shape),
-    //         ptr
-    //     );
-    // });
 
     /////
     ///// Ops
@@ -427,16 +367,17 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
         }
     );
 
-    // // mod.method("op_batchnorm_training", [](
-    // //     const std::shared_ptr<ngraph::Node> input,
-    // //     const std::shared_ptr<ngraph::Node> gamma,
-    // //     const std::shared_ptr<ngraph::Node> beta,
-    // //     double epsilon)
-    // // {
-    // //     auto a = std::make_shared<ngraph::op::BatchNormTraining>(input,
-    // gamma, beta, epsilon);
-    // //     return std::dynamic_pointer_cast<ngraph::Node>(a);
-    // // });
+    mod.method(
+        "op_batchnorm_inference",
+        [](const std::shared_ptr<ov::Node>& input,
+           const std::shared_ptr<ov::Node>& gamma,
+           const std::shared_ptr<ov::Node>& beta,
+           const std::shared_ptr<ov::Node>& mean,
+           const std::shared_ptr<ov::Node>& variance,
+           double epsilon) {
+            return makeop(BatchNormInference, input, gamma, beta, mean, variance, epsilon);
+        }
+    );
 
     mod.method(
         "op_broadcast",
@@ -458,7 +399,7 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
     // reinterpret-cast to convert this to the type we want.
     mod.method(
         "op_constant",
-        [](const ov::element::Type& type,
+        [](const ov::element::Type type,
            const jlcxx::ArrayRef<int64_t> jl_shape,
            const jlcxx::ArrayRef<uint8_t> jl_values) {
             ov::Shape shape = construct<ov::Shape>(jl_shape);
@@ -527,13 +468,6 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
         }
     );
 
-    // // mod.method("op_goe", [](
-    // //     const std::shared_ptr<ov::Node>& arg,
-    // //     uint64_t n)
-    // // {
-    // //     return makeop(v1::GetOutputElement, arg, n);
-    // // });
-
     mod.method("op_log", [](const std::shared_ptr<ov::Node>& arg) {
         return makeop(Log, arg);
     });
@@ -545,24 +479,29 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
         }
     );
 
-    // mod.method("op_maxpool", [](
-    //     const std::shared_ptr<ov::Node>& arg,
-    //     const jlcxx::ArrayRef<int64_t> strides,
-    //     const jlcxx::ArrayRef<int64_t> pads_begin,
-    //     const jlcxx::ArrayRef<int64_t> pads_end,
-    //     const jlcxx::ArrayRef<int64_t> kernel)
-    // {
-    //     return makeop(
-    //         MaxPool,
-    //         arg,
-    //         construct<ov::Strides>(strides),
-    //         construct<ov::Shape>(pads_begin),
-    //         construct<ov::Shape>(pads_end),
-    //         construct<ov::Shape>(kernel),
-    //         ov::op::RoundingType::FLOOR,
-    //         ov::op::PadType::EXPLICIT
-    //     );
-    // });
+    mod.method(
+        "op_maxpool",
+        [](const std::shared_ptr<ov::Node>& arg,
+           const jlcxx::ArrayRef<int64_t> strides,
+           const jlcxx::ArrayRef<int64_t> dilations,
+           const jlcxx::ArrayRef<int64_t> pads_begin,
+           const jlcxx::ArrayRef<int64_t> pads_end,
+           const jlcxx::ArrayRef<int64_t> kernel) {
+            return makeop(
+                MaxPool,
+                arg,
+                construct<ov::Strides>(strides),
+                construct<ov::Strides>(dilations),
+                construct<ov::Shape>(pads_begin),
+                construct<ov::Shape>(pads_end),
+                construct<ov::Shape>(kernel),
+                ov::op::RoundingType::FLOOR,
+                ov::op::PadType::EXPLICIT,
+                ov::element::i64,
+                0
+            );
+        }
+    );
 
     mod.method(
         "op_minimum",
@@ -604,35 +543,43 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
         }
     );
 
+    mod.method(
+        "op_reducesum",
+        [](const std::shared_ptr<ov::Node>& arg,
+           const std::shared_ptr<ov::Node>& reduction_axes,
+           const bool keep_dims) {
+            return makeop(ReduceSum, arg, reduction_axes, keep_dims);
+        }
+    );
+
     mod.method("op_relu", [](const std::shared_ptr<ov::Node>& arg) {
         return makeop(Relu, arg);
     });
 
-    mod.method("op_reshape", [](
-        const std::shared_ptr<ov::Node>& arg,
-        const std::shared_ptr<ov::Node>& shape_pattern)
-    {
-        return makeop(Reshape, arg, shape_pattern, false);
-    });
+    mod.method(
+        "op_reshape",
+        [](const std::shared_ptr<ov::Node>& arg,
+           const std::shared_ptr<ov::Node>& shape_pattern) {
+            return makeop(Reshape, arg, shape_pattern, false);
+        }
+    );
 
     mod.method("op_sigmoid", [](const std::shared_ptr<ov::Node>& arg) {
         return makeop(Sigmoid, arg);
     });
 
-    // // mod.method("op_slice", [](
-    // //     const std::shared_ptr<ov::Node>& arg,
-    // //     const jlcxx::ArrayRef<int64_t,1> lower_bounds,
-    // //     const jlcxx::ArrayRef<int64_t,1> upper_bounds)
-    // // {
-    // //     return makeop(
-    // //         v0::Slice,
-    // //         arg,
-    // //         construct<ov::Coordinate>(lower_bounds),
-    // //         construct<ov::Coordinate>(upper_bounds)
-    // //     );
-    // // });
+    mod.method(
+        "op_slice",
+        [](const std::shared_ptr<ov::Node>& arg,
+           const std::shared_ptr<ov::Node>& start,
+           const std::shared_ptr<ov::Node>& stop,
+           const std::shared_ptr<ov::Node>& step,
+           const std::shared_ptr<ov::Node>& axes) {
+            return makeop(Slice, arg, start, stop, step);
+        }
+    );
 
-    mod.method("op_softmax", [](const std::shared_ptr<ov::Node>& arg, int64_t axis) {
+    mod.method("op_softmax", [](const std::shared_ptr<ov::Node>& arg, const int64_t axis) {
         return makeop(Softmax, arg, axis);
     });
 
@@ -647,10 +594,11 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
         }
     );
 
-    mod.method("op_reducesum", [](
-        const std::shared_ptr<ov::Node>& arg,
-        const std::shared_ptr<ov::Node>& reduction_axes)
-    {
-        return makeop(ReduceSum, arg, reduction_axes);
-    });
+    mod.method(
+        "op_transpose",
+        [](const std::shared_ptr<ov::Node>& arg,
+           const std::shared_ptr<ov::Node>& input_order) {
+            return makeop(Transpose, arg, input_order);
+        }
+    );
 }

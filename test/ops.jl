@@ -189,6 +189,15 @@
     #     @test isapprox(z, parent(f()))
     # end
 
+    @testset "Sqrt" begin
+        x = rand(Float32, 10, 10) .+ one(Float32)
+        function testfunc1(a)
+            return sqrt.(a)
+        end
+        f = OpenVINO.compile(testfunc1, x)
+        @test isapprox(f(), testfunc1(x))
+    end
+
     @testset "Subtract" begin
         x = randn(Float32, 10, 10)
         y = randn(Float32, 10, 10)
@@ -210,10 +219,10 @@
         x = randn(Float32, 10, 10)
         functions = [
             sum,
-            #x -> sum(x; dims = 1),
+            x -> sum(x; dims = 1),
             x -> sum(x; dims = 2),
-            #x -> sum(x; dims = (1, 2)),
-            #x -> sum(x; dims = (2, 1)),
+            x -> sum(x; dims = (1, 2)),
+            x -> sum(x; dims = (2, 1)),
         ]
 
         for (i, fn) in enumerate(functions)
